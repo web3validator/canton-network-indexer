@@ -200,7 +200,15 @@ class LighthouseCollector {
     this.timeoutMs = config.lighthouse.timeoutMs;
   }
 
-  private async get<T>(path: string, params?: Record<string, string>): Promise<RequestResult<T>> {
+  // Last known lighthouse reachability — used by health endpoint
+  public lastReachable: boolean = true;
+  public lastReachableAt: Date | null = null;
+
+  private async get<T>(
+    path: string,
+    params?: Record<string, string>,
+    retries = 3,
+  ): Promise<RequestResult<T>> {
     const url = new URL(path, this.baseUrl);
     if (params) {
       for (const [k, v] of Object.entries(params)) {
@@ -208,23 +216,40 @@ class LighthouseCollector {
       }
     }
 
-    try {
-      const res = await fetch(url.toString(), {
-        signal: AbortSignal.timeout(this.timeoutMs),
-        headers: { Accept: "application/json" },
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        return { ok: false, status: res.status, error: text.slice(0, 200) };
+    let lastError = "";
+    for (let attempt = 0; attempt < retries; attempt++) {
+      if (attempt > 0) {
+        // exponential backoff: 1s, 2s
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
       }
+      try {
+        const res = await fetch(url.toString(), {
+          signal: AbortSignal.timeout(this.timeoutMs),
+          headers: { Accept: "application/json" },
+        });
 
-      const data = (await res.json()) as T;
-      return { ok: true, data };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, status: 0, error: msg };
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          lastError = text.slice(0, 200);
+          // Don't retry 4xx — they won't change
+          if (res.status >= 400 && res.status < 500) {
+            this.lastReachable = false;
+            return { ok: false, status: res.status, error: lastError };
+          }
+          continue;
+        }
+
+        const data = (await res.json()) as T;
+        this.lastReachable = true;
+        this.lastReachableAt = new Date();
+        return { ok: true, data };
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+      }
     }
+
+    this.lastReachable = false;
+    return { ok: false, status: 0, error: lastError };
   }
 
   // ── Stats ────────────────────────────────────────────────────────────────

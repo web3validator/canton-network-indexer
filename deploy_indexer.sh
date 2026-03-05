@@ -5,11 +5,11 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()      { echo -e "${GREEN}[OK]${NC}   $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; }
-header()  { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}\n"; }
+info()   { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()     { echo -e "${GREEN}[OK]${NC}   $*"; }
+warn()   { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+header() { echo -e "\n${BOLD}${CYAN}══ $* ══${NC}\n"; }
 
 # ─── Network config ───────────────────────────────────────────────────────────
 declare -A NET_LIGHTHOUSE=(
@@ -34,119 +34,144 @@ declare -A NET_DB_NAME=(
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INDEXER_DIR="$(cd "$SCRIPT_DIR/../indexer" && pwd)"
 
-# ─── Usage ────────────────────────────────────────────────────────────────────
+# ─── Args ─────────────────────────────────────────────────────────────────────
+NETWORKS=""
+ACTION="deploy"
+STOP_NETS=""
+REMOTE_MODE=false
+SSH_HOST=""
+SSH_USER="ubuntu"
+BASE_DIR="$HOME/canton-indexer"
+DOMAIN=""
+NGINX_MODE="local"  # local | domain
+
 usage() {
   echo -e "${BOLD}Usage:${NC} $0 [OPTIONS]"
   echo ""
+  echo "  By default deploys locally on this machine."
+  echo ""
   echo "Options:"
-  echo "  -h, --host HOST       Remote host (e.g. 107.155.103.210)"
-  echo "  -u, --user USER       SSH user (default: ubuntu)"
-  echo "  -n, --networks NETS   Comma-separated networks: mainnet,testnet,devnet (default: ask)"
-  echo "  -r, --remote-dir DIR  Remote deploy dir (default: ~/canton-indexer)"
-  echo "  --stop NETS           Stop indexers for given networks and exit"
-  echo "  --status              Show status of deployed indexers and exit"
-  echo "  --help                Show this help"
+  echo "  -n, --networks NETS     mainnet,testnet,devnet or 'all' (default: ask)"
+  echo "  -d, --dir DIR           Base deploy dir (default: ~/canton-indexer)"
+  echo "  --remote HOST           Deploy to remote server via SSH"
+  echo "  --user USER             SSH user for remote deploy (default: ubuntu)"
+  echo "  --stop NETS             Stop indexers and exit"
+  echo "  --status                Show status and exit"
+  echo "  --help                  Show this help"
   echo ""
   echo "Examples:"
-  echo "  $0 -h 107.155.103.210 -u sol -n mainnet,testnet,devnet"
-  echo "  $0 -h 107.155.103.210 -u sol --status"
-  echo "  $0 -h 107.155.103.210 -u sol --stop devnet"
+  echo "  $0                                          # interactive local deploy"
+  echo "  $0 -n mainnet                               # deploy mainnet locally"
+  echo "  $0 -n mainnet,testnet,devnet                # deploy all locally"
+  echo "  $0 --remote 1.2.3.4 --user ubuntu -n all   # deploy all on remote"
+  echo "  $0 --status"
+  echo "  $0 --stop devnet"
   exit 0
 }
 
-# ─── Args ─────────────────────────────────────────────────────────────────────
-SSH_HOST=""
-SSH_USER="ubuntu"
-NETWORKS=""
-REMOTE_BASE="canton-indexer"
-ACTION="deploy"
-STOP_NETS=""
-
 while [[ $# -gt 0 ]]; do
   case $1 in
-    -h|--host)      SSH_HOST="$2";    shift 2 ;;
-    -u|--user)      SSH_USER="$2";    shift 2 ;;
-    -n|--networks)  NETWORKS="$2";    shift 2 ;;
-    -r|--remote-dir) REMOTE_BASE="$2"; shift 2 ;;
+    -n|--networks)  NETWORKS="$2";   shift 2 ;;
+    -d|--dir)       BASE_DIR="$2";   shift 2 ;;
+    --remote)       REMOTE_MODE=true; SSH_HOST="$2"; shift 2 ;;
+    --user)         SSH_USER="$2";   shift 2 ;;
     --stop)         ACTION="stop";   STOP_NETS="$2"; shift 2 ;;
     --status)       ACTION="status"; shift ;;
     --help)         usage ;;
-    *) error "Unknown option: $1"; usage ;;
+    *) echo -e "${RED}Unknown option: $1${NC}"; usage ;;
   esac
 done
 
-# ─── SSH helper ───────────────────────────────────────────────────────────────
-ssh_run() { ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"; }
-ssh_run_q() { ssh -o StrictHostKeyChecking=no -q "$SSH_USER@$SSH_HOST" "$@" 2>/dev/null || true; }
+# ─── Exec helpers ─────────────────────────────────────────────────────────────
+# run_cmd: runs locally or remotely depending on mode
+run_cmd() {
+  if $REMOTE_MODE; then
+    ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$@"
+  else
+    bash -c "$*"
+  fi
+}
 
-# ─── Prompt for host if not set ───────────────────────────────────────────────
-if [[ -z "$SSH_HOST" ]]; then
-  echo -e "${BOLD}Canton Network Indexer — Multi-Network Deploy${NC}"
-  echo ""
-  read -rp "Remote host IP or domain: " SSH_HOST
-  read -rp "SSH user [ubuntu]: " input_user
-  SSH_USER="${input_user:-ubuntu}"
+run_cmd_q() {
+  if $REMOTE_MODE; then
+    ssh -o StrictHostKeyChecking=no -q "$SSH_USER@$SSH_HOST" "$@" 2>/dev/null || true
+  else
+    bash -c "$*" 2>/dev/null || true
+  fi
+}
+
+run_cmd_health() {
+  local port="$1"
+  if $REMOTE_MODE; then
+    ssh -o StrictHostKeyChecking=no -q "$SSH_USER@$SSH_HOST" "curl -s http://127.0.0.1:$port/health" 2>/dev/null || true
+  else
+    curl -s "http://127.0.0.1:$port/health" 2>/dev/null || true
+  fi
+}
+
+# ─── Check connection ─────────────────────────────────────────────────────────
+if $REMOTE_MODE; then
+  header "Checking SSH connection"
+  if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$SSH_USER@$SSH_HOST" "echo ok" &>/dev/null; then
+    error "Cannot connect to $SSH_USER@$SSH_HOST — check SSH key authorization"
+  fi
+  ok "Connected to $SSH_USER@$SSH_HOST"
+  DEPLOY_TARGET="$SSH_HOST"
+else
+  header "Local deploy"
+  ok "Deploying on this machine"
+  DEPLOY_TARGET="localhost"
 fi
 
-# ─── Test SSH ─────────────────────────────────────────────────────────────────
-header "Checking SSH connection"
-if ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$SSH_USER@$SSH_HOST" "echo ok" &>/dev/null; then
-  error "Cannot connect to $SSH_USER@$SSH_HOST"
-  echo "  Make sure your SSH key is authorized on the remote host."
-  exit 1
-fi
-ok "Connected to $SSH_USER@$SSH_HOST"
-
-# ─── STATUS action ────────────────────────────────────────────────────────────
+# ─── STATUS ───────────────────────────────────────────────────────────────────
 if [[ "$ACTION" == "status" ]]; then
-  header "Indexer Status on $SSH_HOST"
+  header "Indexer Status — $DEPLOY_TARGET"
   for net in mainnet testnet devnet; do
-    dir="~/$REMOTE_BASE-$net"
     port="${NET_PORT[$net]}"
-    exists=$(ssh_run_q "test -d $dir && echo yes || echo no")
+    dir="$BASE_DIR-$net"
+    exists=$(run_cmd_q "test -d $dir && echo yes || echo no")
     if [[ "$exists" != "yes" ]]; then
       echo -e "  ${YELLOW}$net${NC}: not deployed"
       continue
     fi
-    status=$(ssh_run_q "cd $dir && docker compose ps --format '{{.Status}}' 2>/dev/null | head -1" || echo "unknown")
-    health=$(ssh_run_q "curl -s http://127.0.0.1:$port/health 2>/dev/null" || echo "")
+    compose_status=$(run_cmd_q "cd $dir && docker compose ps --format '{{.Status}}' 2>/dev/null | head -1" || echo "unknown")
+    health=$(run_cmd_health "$port")
     if echo "$health" | grep -q '"status":"ok"'; then
-      uptime=$(echo "$health" | grep -o '"uptime":[0-9.]*' | cut -d: -f2)
-      uptime_h=$(echo "$uptime / 3600" | bc 2>/dev/null || echo "?")
-      echo -e "  ${GREEN}$net${NC}: healthy  port=$port  uptime=${uptime_h}h  [$status]"
+      uptime_s=$(echo "$health" | grep -o '"uptime":[0-9.]*' | cut -d: -f2 | cut -d. -f1)
+      uptime_h=$(( ${uptime_s:-0} / 3600 ))
+      echo -e "  ${GREEN}✓ $net${NC}  port=$port  uptime=${uptime_h}h  [$compose_status]"
     else
-      echo -e "  ${RED}$net${NC}: unhealthy  port=$port  [$status]"
+      echo -e "  ${RED}✗ $net${NC}  port=$port  [${compose_status:-not running}]"
     fi
   done
   echo ""
   exit 0
 fi
 
-# ─── STOP action ──────────────────────────────────────────────────────────────
+# ─── STOP ─────────────────────────────────────────────────────────────────────
 if [[ "$ACTION" == "stop" ]]; then
-  header "Stopping indexers: $STOP_NETS"
+  header "Stopping: $STOP_NETS"
   IFS=',' read -ra nets <<< "$STOP_NETS"
   for net in "${nets[@]}"; do
     net="${net// /}"
-    dir="~/$REMOTE_BASE-$net"
-    exists=$(ssh_run_q "test -d $dir && echo yes || echo no")
+    dir="$BASE_DIR-$net"
+    exists=$(run_cmd_q "test -d $dir && echo yes || echo no")
     if [[ "$exists" != "yes" ]]; then
       warn "$net: not deployed, skipping"
       continue
     fi
     info "Stopping $net..."
-    ssh_run "cd $dir && docker compose down" && ok "$net stopped"
+    run_cmd "cd $dir && docker compose down" && ok "$net stopped"
   done
   exit 0
 fi
 
-# ─── DEPLOY: choose networks ──────────────────────────────────────────────────
+# ─── Choose networks ──────────────────────────────────────────────────────────
 header "Network Selection"
 
 if [[ -z "$NETWORKS" ]]; then
-  echo "Which networks to deploy? (space-separated, or 'all')"
+  echo "Which networks to deploy?"
   echo "  1) mainnet"
   echo "  2) testnet"
   echo "  3) devnet"
@@ -169,38 +194,108 @@ if [[ -z "$NETWORKS" ]]; then
   fi
 fi
 
+[[ -z "$NETWORKS" ]] && error "No networks selected"
 IFS=',' read -ra DEPLOY_NETS <<< "$NETWORKS"
 info "Will deploy: ${DEPLOY_NETS[*]}"
 
-# ─── Check indexer source ─────────────────────────────────────────────────────
-header "Preparing source"
-if [[ ! -f "$INDEXER_DIR/Dockerfile" ]]; then
-  error "Indexer source not found at $INDEXER_DIR"
-  exit 1
-fi
-ok "Source: $INDEXER_DIR"
+# ─── Access mode ──────────────────────────────────────────────────────────────
+header "Access Configuration"
+echo "How will the API be accessed?"
+echo "  1) Locally only (localhost ports — default)"
+echo "  2) Public via domain (nginx + SSL)"
+echo ""
+read -rp "Choice [1]: " access_input
+access_input="${access_input:-1}"
 
-# ─── Check remote Docker ──────────────────────────────────────────────────────
-header "Checking remote Docker"
-if ! ssh_run "docker info &>/dev/null"; then
-  error "Docker not available on remote host"
-  exit 1
+if [[ "$access_input" == "2" || "$access_input" == "domain" ]]; then
+  NGINX_MODE="domain"
+  read -rp "Domain (e.g. indexer.example.com): " DOMAIN
+  [[ -z "$DOMAIN" ]] && error "Domain cannot be empty"
+  info "Will configure nginx for: $DOMAIN"
+  info "  mainnet → https://$DOMAIN/"
+  [[ "${#DEPLOY_NETS[@]}" -gt 1 ]] && info "  testnet → https://$DOMAIN/testnet/"
+  [[ "${#DEPLOY_NETS[@]}" -gt 2 ]] && info "  devnet  → https://$DOMAIN/devnet/"
+else
+  NGINX_MODE="local"
+  info "Local mode — APIs will be available on localhost only"
 fi
+
+# ─── Check Docker ─────────────────────────────────────────────────────────────
+header "Checking Docker"
+run_cmd "docker info" &>/dev/null || error "Docker not available"
 ok "Docker OK"
 
-# ─── Copy source once ─────────────────────────────────────────────────────────
-header "Uploading indexer source"
+# ─── Upload source (remote only) ──────────────────────────────────────────────
+if $REMOTE_MODE; then
+  header "Uploading source"
+  TMP_ARCHIVE="/tmp/canton-indexer-src-$$.tar.gz"
+  tar czf "$TMP_ARCHIVE" \
+    --exclude="$SCRIPT_DIR/node_modules" \
+    --exclude="$SCRIPT_DIR/dist" \
+    -C "$SCRIPT_DIR" .
+  scp -o StrictHostKeyChecking=no "$TMP_ARCHIVE" "$SSH_USER@$SSH_HOST:/tmp/canton-indexer-src.tar.gz"
+  rm -f "$TMP_ARCHIVE"
+  ok "Source uploaded"
+fi
 
-TMP_ARCHIVE="/tmp/canton-indexer-src-$$.tar.gz"
-tar czf "$TMP_ARCHIVE" \
-  --exclude="$INDEXER_DIR/node_modules" \
-  --exclude="$INDEXER_DIR/dist" \
-  -C "$(dirname "$INDEXER_DIR")" \
-  "$(basename "$INDEXER_DIR")"
+# ─── Write config files ───────────────────────────────────────────────────────
+write_env() {
+  local dir="$1" net="$2" lighthouse="$3" db_name="$4" db_pass="$5"
+  printf 'CANTON_NETWORK=%s\nLIGHTHOUSE_URL=%s\nPORT=3000\nHOST=0.0.0.0\nLOG_LEVEL=info\n' \
+    "$net" "$lighthouse" > "$dir/.env"
+  printf 'DB_NAME=%s\nDB_USER=canton\nDB_PASSWORD=%s\nDATABASE_URL=postgres://canton:%s@postgres:5432/%s\n' \
+    "$db_name" "$db_pass" "$db_pass" "$db_name" >> "$dir/.env"
+  printf 'POLL_STATS_SEC=60\nPOLL_VALIDATORS_SEC=300\nPOLL_REWARDS_SEC=900\n' >> "$dir/.env"
+  printf 'POLL_GOVERNANCE_SEC=1800\nPOLL_SNAPSHOT_SEC=3600\n' >> "$dir/.env"
+  printf 'VALIDATOR_API_ENABLED=false\nSCAN_API_ENABLED=false\n' >> "$dir/.env"
+}
 
-scp -o StrictHostKeyChecking=no "$TMP_ARCHIVE" "$SSH_USER@$SSH_HOST:/tmp/canton-indexer-src.tar.gz"
-rm -f "$TMP_ARCHIVE"
-ok "Source uploaded"
+write_compose() {
+  local dir="$1" net="$2" port="$3" db_port="$4" db_name="$5" db_pass="$6"
+  printf '%s\n' \
+    "version: '3.9'" \
+    "services:" \
+    "  postgres:" \
+    "    image: postgres:16-alpine" \
+    "    container_name: canton-${net}-postgres" \
+    "    restart: unless-stopped" \
+    "    environment:" \
+    "      POSTGRES_DB: ${db_name}" \
+    "      POSTGRES_USER: canton" \
+    "      POSTGRES_PASSWORD: ${db_pass}" \
+    "    volumes:" \
+    "      - postgres_data:/var/lib/postgresql/data" \
+    "    ports:" \
+    "      - \"127.0.0.1:${db_port}:5432\"" \
+    "    healthcheck:" \
+    "      test: [\"CMD-SHELL\", \"pg_isready -U canton -d ${db_name}\"]" \
+    "      interval: 5s" \
+    "      timeout: 5s" \
+    "      retries: 10" \
+    "  indexer:" \
+    "    build:" \
+    "      context: ." \
+    "      dockerfile: Dockerfile" \
+    "    container_name: canton-${net}-indexer" \
+    "    restart: unless-stopped" \
+    "    depends_on:" \
+    "      postgres:" \
+    "        condition: service_healthy" \
+    "    env_file: .env" \
+    "    environment:" \
+    "      DATABASE_URL: postgres://canton:${db_pass}@postgres:5432/${db_name}" \
+    "    ports:" \
+    "      - \"127.0.0.1:${port}:3000\"" \
+    "    healthcheck:" \
+    "      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:3000/health || exit 1\"]" \
+    "      interval: 15s" \
+    "      timeout: 5s" \
+    "      retries: 5" \
+    "      start_period: 60s" \
+    "volumes:" \
+    "  postgres_data:" \
+    > "$dir/docker-compose.yml"
+}
 
 # ─── Deploy each network ──────────────────────────────────────────────────────
 for net in "${DEPLOY_NETS[@]}"; do
@@ -211,140 +306,203 @@ for net in "${DEPLOY_NETS[@]}"; do
   db_port="${NET_DB_PORT[$net]}"
   db_name="${NET_DB_NAME[$net]}"
   lighthouse="${NET_LIGHTHOUSE[$net]}"
-  remote_dir="~/$REMOTE_BASE-$net"
+  deploy_dir="$BASE_DIR-$net"
 
-  info "Port: $port  DB port: $db_port  DB: $db_name"
-  info "Lighthouse: $lighthouse"
+  info "Port: $port  |  DB port: $db_port  |  Lighthouse: $lighthouse"
 
-  # Generate random DB password
-  db_pass=$(openssl rand -hex 16 2>/dev/null || cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 32)
+  db_pass=$(openssl rand -hex 16 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
 
-  ssh_run bash -s -- "$remote_dir" "$net" "$port" "$db_port" "$db_name" "$db_pass" "$lighthouse" << 'REMOTE'
-set -euo pipefail
-REMOTE_DIR="$1"; NET="$2"; PORT="$3"; DB_PORT="$4"; DB_NAME="$5"; DB_PASS="$6"; LIGHTHOUSE="$7"
+  # If already deployed — stop and remove volumes to avoid stale DB password
+  if $REMOTE_MODE; then
+    exists=$(run_cmd_q "test -d $deploy_dir && echo yes || echo no")
+  else
+    [[ -d "$deploy_dir" ]] && exists="yes" || exists="no"
+  fi
+  if [[ "$exists" == "yes" ]]; then
+    info "$net already deployed — stopping and removing old volumes..."
+    run_cmd "cd $deploy_dir && docker compose down -v 2>&1" | tail -5
+  fi
 
-# Expand ~
-REMOTE_DIR="${REMOTE_DIR/#\~/$HOME}"
+  if $REMOTE_MODE; then
+    # Write files locally to a tmp dir, scp them over
+    TMP_DIR=$(mktemp -d)
+    rsync -a --exclude='node_modules' --exclude='dist' "$SCRIPT_DIR/" "$TMP_DIR/"
+    write_env "$TMP_DIR" "$net" "$lighthouse" "$db_name" "$db_pass"
+    write_compose "$TMP_DIR" "$net" "$port" "$db_port" "$db_name" "$db_pass"
+    TMP_ARCHIVE="/tmp/canton-indexer-${net}-$$.tar.gz"
+    tar czf "$TMP_ARCHIVE" -C "$TMP_DIR" .
+    rm -rf "$TMP_DIR"
+    scp -o StrictHostKeyChecking=no "$TMP_ARCHIVE" "$SSH_USER@$SSH_HOST:/tmp/canton-indexer-${net}.tar.gz"
+    rm -f "$TMP_ARCHIVE"
+    ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" \
+      "mkdir -p $deploy_dir && tar xzf /tmp/canton-indexer-${net}.tar.gz -C $deploy_dir && rm -f /tmp/canton-indexer-${net}.tar.gz"
+  else
+    mkdir -p "$deploy_dir"
+    rsync -a --exclude='node_modules' --exclude='dist' --exclude='*-mainnet' \
+      --exclude='*-testnet' --exclude='*-devnet' "$SCRIPT_DIR/" "$deploy_dir/"
+    write_env "$deploy_dir" "$net" "$lighthouse" "$db_name" "$db_pass"
+    write_compose "$deploy_dir" "$net" "$port" "$db_port" "$db_name" "$db_pass"
+  fi
+  ok "Config written to $deploy_dir"
 
-mkdir -p "$REMOTE_DIR"
-tar xzf /tmp/canton-indexer-src.tar.gz -C "$REMOTE_DIR" --strip-components=1
+  info "Building and starting $net..."
+  run_cmd "cd $deploy_dir && docker compose up -d --build 2>&1" | tail -15
 
-# Write .env
-cat > "$REMOTE_DIR/.env" << ENV
-CANTON_NETWORK=$NET
-LIGHTHOUSE_URL=$LIGHTHOUSE
-PORT=3000
-HOST=0.0.0.0
-LOG_LEVEL=info
-DB_NAME=$DB_NAME
-DB_USER=canton
-DB_PASSWORD=$DB_PASS
-DATABASE_URL=postgres://canton:${DB_PASS}@postgres:5432/${DB_NAME}
-POLL_STATS_SEC=60
-POLL_VALIDATORS_SEC=300
-POLL_REWARDS_SEC=900
-POLL_GOVERNANCE_SEC=1800
-POLL_SNAPSHOT_SEC=3600
-VALIDATOR_API_ENABLED=false
-SCAN_API_ENABLED=false
-ENV
-
-# Write docker-compose.yml with network-specific ports/names
-cat > "$REMOTE_DIR/docker-compose.yml" << DC
-version: '3.9'
-
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: canton-${NET}-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: \${DB_NAME:-$DB_NAME}
-      POSTGRES_USER: \${DB_USER:-canton}
-      POSTGRES_PASSWORD: \${DB_PASSWORD:-$DB_PASS}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "127.0.0.1:${DB_PORT}:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U canton -d $DB_NAME"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  indexer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: canton-${NET}-indexer
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file: .env
-    environment:
-      DATABASE_URL: postgres://canton:${DB_PASS}@postgres:5432/${DB_NAME}
-    ports:
-      - "127.0.0.1:${PORT}:3000"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-
-volumes:
-  postgres_data:
-DC
-
-echo "Files written to $REMOTE_DIR"
-REMOTE
-
-  info "Building and starting $net indexer..."
-  ssh_run "cd ~/$REMOTE_BASE-$net && docker compose up -d --build 2>&1" | tail -20
-
-  # Wait for healthy
   info "Waiting for $net to become healthy (up to 120s)..."
+  health=""
   deadline=$((SECONDS + 120))
   while [[ $SECONDS -lt $deadline ]]; do
-    health=$(ssh_run_q "curl -s http://127.0.0.1:$port/health" || echo "")
+    health=$(run_cmd_health "$port")
     if echo "$health" | grep -q '"status":"ok"'; then
-      ok "$net indexer healthy on port $port"
-      echo -e "  Network:    $net"
-      echo -e "  Lighthouse: $lighthouse"
-      echo -e "  API port:   $port (localhost)"
-      echo -e "  DB port:    $db_port (localhost)"
+      ok "$net is healthy"
       break
     fi
     sleep 5
   done
-  if ! echo "$health" | grep -q '"status":"ok"'; then
-    warn "$net indexer not healthy yet — check logs:"
-    echo "  ssh $SSH_USER@$SSH_HOST 'docker logs canton-${net}-indexer --tail 30'"
+
+  if echo "$health" | grep -q '"status":"ok"'; then
+    echo -e "  ${GREEN}✓${NC} API:  http://127.0.0.1:$port"
+    echo -e "  ${GREEN}✓${NC} Docs: http://127.0.0.1:$port/docs"
+  else
+    warn "$net not healthy yet — check logs:"
+    if $REMOTE_MODE; then
+      echo "  ssh $SSH_USER@$SSH_HOST 'docker logs canton-${net}-indexer --tail 30'"
+    else
+      echo "  docker logs canton-${net}-indexer --tail 30"
+    fi
   fi
 done
 
-# ─── Cleanup tmp ──────────────────────────────────────────────────────────────
-ssh_run_q "rm -f /tmp/canton-indexer-src.tar.gz"
+# ─── Cleanup ──────────────────────────────────────────────────────────────────
+$REMOTE_MODE && run_cmd_q "rm -f /tmp/canton-indexer-src.tar.gz"
 
-# ─── Final status ─────────────────────────────────────────────────────────────
+# ─── Nginx setup ──────────────────────────────────────────────────────────────
+if [[ "$NGINX_MODE" == "domain" ]]; then
+  header "Configuring nginx for $DOMAIN"
+
+  NGINX_CONF="/etc/nginx/sites-available/canton-indexer"
+
+  # Build nginx config using printf
+  {
+    printf 'server {\n'
+    printf '    listen 80;\n'
+    printf '    server_name %s;\n\n' "$DOMAIN"
+    printf '    # mainnet — default\n'
+    printf '    location / {\n'
+    printf '        proxy_pass http://127.0.0.1:%s;\n' "${NET_PORT[mainnet]}"
+    printf '        proxy_http_version 1.1;\n'
+    printf '        proxy_set_header Host $host;\n'
+    printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+    printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+    printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+    printf '    }\n'
+
+    # add /testnet/ block if testnet deployed
+    if printf '%s\n' "${DEPLOY_NETS[@]}" | grep -q '^testnet$'; then
+      printf '\n    location /testnet/ {\n'
+      printf '        rewrite ^/testnet/(.*) /$1 break;\n'
+      printf '        proxy_pass http://127.0.0.1:%s;\n' "${NET_PORT[testnet]}"
+      printf '        proxy_http_version 1.1;\n'
+      printf '        proxy_set_header Host $host;\n'
+      printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+      printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+      printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+      printf '    }\n'
+    fi
+
+    # add /devnet/ block if devnet deployed
+    if printf '%s\n' "${DEPLOY_NETS[@]}" | grep -q '^devnet$'; then
+      printf '\n    location /devnet/ {\n'
+      printf '        rewrite ^/devnet/(.*) /$1 break;\n'
+      printf '        proxy_pass http://127.0.0.1:%s;\n' "${NET_PORT[devnet]}"
+      printf '        proxy_http_version 1.1;\n'
+      printf '        proxy_set_header Host $host;\n'
+      printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+      printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+      printf '        proxy_set_header X-Forwarded-Proto $scheme;\n'
+      printf '    }\n'
+    fi
+
+    printf '}\n'
+  } > /tmp/canton-nginx.conf
+
+  if command -v nginx &>/dev/null; then
+    sudo cp /tmp/canton-nginx.conf "$NGINX_CONF"
+    sudo ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/canton-indexer 2>/dev/null || true
+    if sudo nginx -t &>/dev/null; then
+      if sudo systemctl is-active --quiet nginx 2>/dev/null; then
+        sudo systemctl reload nginx
+      else
+        sudo systemctl start nginx
+      fi
+      ok "nginx configured and reloaded"
+    else
+      warn "nginx config test failed — check $NGINX_CONF"
+    fi
+
+    # SSL via certbot
+    if command -v certbot &>/dev/null; then
+      read -rp "$(echo -e "${BOLD}Run certbot for SSL? [y/N]:${NC} ")" ssl_input
+      if [[ "${ssl_input,,}" == "y" ]]; then
+        sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || \
+          warn "certbot failed — run manually: sudo certbot --nginx -d $DOMAIN"
+      fi
+    else
+      warn "certbot not installed — to enable SSL:"
+      echo "  sudo apt install certbot python3-certbot-nginx -y"
+      echo "  sudo certbot --nginx -d $DOMAIN"
+    fi
+  else
+    warn "nginx not installed — config saved to /tmp/canton-nginx.conf"
+    echo "  Install nginx and copy the config manually:"
+    echo "  sudo apt install nginx -y"
+    echo "  sudo cp /tmp/canton-nginx.conf /etc/nginx/sites-available/canton-indexer"
+    echo "  sudo ln -s /etc/nginx/sites-available/canton-indexer /etc/nginx/sites-enabled/"
+    echo "  sudo systemctl start nginx"
+  fi
+fi
+
+# ─── Summary ──────────────────────────────────────────────────────────────────
 header "Deploy Complete"
-echo -e "${BOLD}Deployed networks:${NC}"
 for net in "${DEPLOY_NETS[@]}"; do
   net="${net// /}"
   port="${NET_PORT[$net]}"
-  health=$(ssh_run_q "curl -s http://127.0.0.1:$port/health" || echo "")
+  health=$(run_cmd_health "$port")
   if echo "$health" | grep -q '"status":"ok"'; then
-    echo -e "  ${GREEN}✓${NC} $net  →  http://127.0.0.1:$port"
+    if [[ "$NGINX_MODE" == "domain" ]]; then
+      if [[ "$net" == "mainnet" ]]; then
+        echo -e "  ${GREEN}✓${NC} $net  →  https://$DOMAIN/"
+      else
+        echo -e "  ${GREEN}✓${NC} $net  →  https://$DOMAIN/$net/"
+      fi
+    else
+      echo -e "  ${GREEN}✓${NC} $net  →  http://127.0.0.1:$port"
+    fi
   else
-    echo -e "  ${RED}✗${NC} $net  →  http://127.0.0.1:$port  (check logs)"
+    echo -e "  ${RED}✗${NC} $net  →  http://127.0.0.1:$port  (not healthy)"
   fi
 done
 
 echo ""
-echo -e "${BOLD}Useful commands:${NC}"
-echo "  Status:  $0 -h $SSH_HOST -u $SSH_USER --status"
-echo "  Stop:    $0 -h $SSH_HOST -u $SSH_USER --stop mainnet"
-echo "  Logs:    ssh $SSH_USER@$SSH_HOST 'docker logs canton-mainnet-indexer -f'"
-echo "  API:     ssh -L 3010:localhost:3010 $SSH_USER@$SSH_HOST -N  →  http://localhost:3010/docs"
+if $REMOTE_MODE; then
+  echo -e "${BOLD}Useful commands:${NC}"
+  echo "  Status: $0 --remote $SSH_HOST --user $SSH_USER --status"
+  echo "  Stop:   $0 --remote $SSH_HOST --user $SSH_USER --stop mainnet"
+  echo "  Logs:   ssh $SSH_USER@$SSH_HOST 'docker logs canton-mainnet-indexer -f'"
+  echo "  Tunnel: ssh -L 3010:localhost:3010 $SSH_USER@$SSH_HOST -N"
+else
+  echo -e "${BOLD}Useful commands:${NC}"
+  echo "  Status: $0 --status"
+  echo "  Stop:   $0 --stop mainnet"
+  echo "  Logs:   docker logs canton-mainnet-indexer -f"
+  if [[ "$NGINX_MODE" == "domain" ]]; then
+    echo "  API:    https://$DOMAIN  (mainnet)"
+    printf '%s\n' "${DEPLOY_NETS[@]}" | grep -q '^testnet$' && echo "          https://$DOMAIN/testnet/"
+    printf '%s\n' "${DEPLOY_NETS[@]}" | grep -q '^devnet$'  && echo "          https://$DOMAIN/devnet/"
+  else
+    echo "  API:    http://127.0.0.1:3010  (mainnet)"
+    echo "          http://127.0.0.1:3011  (testnet)"
+    echo "          http://127.0.0.1:3012  (devnet)"
+  fi
+fi
 echo ""

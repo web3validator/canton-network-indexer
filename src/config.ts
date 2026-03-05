@@ -107,8 +107,8 @@ export const config = {
   },
 
   cache: {
-    // How long to serve stale data (ms) if upstream is down
-    staleTtlMs: optionalInt("CACHE_STALE_TTL_MS", 300_000),
+    // How long to serve stale data (ms) if upstream is down (default 30min)
+    staleTtlMs: optionalInt("CACHE_STALE_TTL_MS", 1_800_000),
   },
 } as const;
 

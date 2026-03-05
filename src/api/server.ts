@@ -4,6 +4,7 @@ import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { config } from "../config.js";
 import { checkConnection, migrate } from "../storage/db.js";
+import { lighthouse } from "../collectors/lighthouse.js";
 import { registerStatsRoutes } from "./routes/stats.js";
 import { registerValidatorRoutes } from "./routes/validators.js";
 import { registerTransactionRoutes } from "./routes/transactions.js";
@@ -118,6 +119,8 @@ export async function buildServer(): Promise<FastifyInstance> {
               network: { type: "string" },
               db: { type: "boolean" },
               uptime: { type: "number" },
+              lighthouse: { type: "boolean" },
+              lighthouse_last_ok: { type: "string", nullable: true },
             },
           },
         },
@@ -125,10 +128,15 @@ export async function buildServer(): Promise<FastifyInstance> {
     },
     async (_req, reply) => {
       const db = await checkConnection();
+      const lhReachable = lighthouse.lastReachable;
+      const lhLastOk = lighthouse.lastReachableAt?.toISOString() ?? null;
+      const status = db && lhReachable ? "ok" : "degraded";
       return reply.send({
-        status: db ? "ok" : "degraded",
+        status,
         network: config.network,
         db,
+        lighthouse: lhReachable,
+        lighthouse_last_ok: lhLastOk,
         uptime: process.uptime(),
       });
     },
