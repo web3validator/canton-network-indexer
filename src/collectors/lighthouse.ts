@@ -21,6 +21,7 @@ export interface LighthouseValidator {
   sponsor?: string;
   dso?: string;
   last_active_at?: string | null;
+  is_active?: boolean;
   first_round?: number;
   last_round?: number;
   miss_round?: number;
@@ -29,6 +30,18 @@ export interface LighthouseValidator {
   metadata_last_update?: string | null;
   created_at?: string;
   [key: string]: unknown;
+}
+
+const VALIDATOR_ACTIVE_THRESHOLD_MS = 10 * 60 * 1000;
+
+export function normalizeValidator(v: LighthouseValidator): LighthouseValidator {
+  if (typeof v.is_active === "boolean") return v;
+  return {
+    ...v,
+    is_active: v.last_active_at
+      ? Date.now() - new Date(v.last_active_at).getTime() < VALIDATOR_ACTIVE_THRESHOLD_MS
+      : false,
+  };
 }
 
 export interface LighthouseValidatorDetail {

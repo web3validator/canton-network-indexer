@@ -15,7 +15,8 @@ export async function registerValidatorRoutes(server: FastifyInstance): Promise<
           type: "object",
           properties: {
             live: { type: "boolean", description: "Force live fetch" },
-            limit: { type: "integer", default: 1000, maximum: 1000 },
+            limit: { type: "integer", default: 1000, maximum: 10000 },
+            search: { type: "string", description: "Filter by name or id (case-insensitive)" },
           },
         },
       },
@@ -23,18 +24,31 @@ export async function registerValidatorRoutes(server: FastifyInstance): Promise<
     async (req, reply) => {
       const q = req.query as Record<string, unknown>;
       const live = q["live"] === true || q["live"] === "true";
-      const limit = Math.min(Number(q["limit"] ?? 1000), 1000);
+      const search =
+        typeof q["search"] === "string" && q["search"].trim() ? q["search"].trim() : null;
+      const limit = search ? 10000 : Math.min(Number(q["limit"] ?? 1000), 1000);
 
       if (!live) {
-        const rows = await queryRows<Record<string, unknown>>(
-          `SELECT id, name, party_id, is_active, version, first_seen_at, last_seen_at
-           FROM validators
-           WHERE network = $1
-           ORDER BY last_seen_at DESC
-           LIMIT $2`,
-          [config.network, limit],
-        );
-        if (rows.length > 0) {
+        let sql: string;
+        let params: unknown[];
+        if (search) {
+          sql = `SELECT id, name, party_id, is_active, version, first_seen_at, last_seen_at
+                 FROM validators
+                 WHERE network = $1
+                   AND (id ILIKE $2 OR name ILIKE $2)
+                 ORDER BY last_seen_at DESC
+                 LIMIT $3`;
+          params = [config.network, `%${search}%`, limit];
+        } else {
+          sql = `SELECT id, name, party_id, is_active, version, first_seen_at, last_seen_at
+                 FROM validators
+                 WHERE network = $1
+                 ORDER BY last_seen_at DESC
+                 LIMIT $2`;
+          params = [config.network, limit];
+        }
+        const rows = await queryRows<Record<string, unknown>>(sql, params);
+        if (rows.length > 0 || search) {
           return reply.send({ network: config.network, count: rows.length, data: rows });
         }
       }

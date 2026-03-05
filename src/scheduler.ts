@@ -1,6 +1,6 @@
 import cron from "node-cron";
 import { config } from "./config.js";
-import { lighthouse } from "./collectors/lighthouse.js";
+import { lighthouse, normalizeValidator } from "./collectors/lighthouse.js";
 import {
   scan,
   matchesTemplate,
@@ -66,8 +66,9 @@ async function pollValidators(): Promise<void> {
   }
 
   const validators = res.data.validators ?? [];
-  for (const v of validators) {
-    if (!v.id) continue;
+  for (const raw of validators) {
+    if (!raw.id) continue;
+    const v = normalizeValidator(raw);
     await query(
       `INSERT INTO validators (id, network, name, party_id, is_active, version, last_seen_at, raw)
        VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
@@ -76,20 +77,12 @@ async function pollValidators(): Promise<void> {
          version      = EXCLUDED.version,
          last_seen_at = NOW(),
          raw          = EXCLUDED.raw`,
-      [
-        v.id,
-        network,
-        null,
-        null,
-        v.last_active_at ? true : false,
-        v.version ?? null,
-        JSON.stringify(v),
-      ],
+      [v.id, network, null, null, v.is_active ?? false, v.version ?? null, JSON.stringify(v)],
     );
     await query(
       `INSERT INTO validator_snapshots (validator_id, network, is_active, raw)
        VALUES ($1, $2, $3, $4)`,
-      [v.id, network, v.last_active_at ? true : false, JSON.stringify(v)],
+      [v.id, network, v.is_active ?? false, JSON.stringify(v)],
     );
   }
   console.log(`[scheduler] validators upserted: ${validators.length}`);
