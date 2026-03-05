@@ -226,6 +226,102 @@ INSERT INTO schema_migrations (version)
 VALUES ('001_initial')
 ON CONFLICT (version) DO NOTHING;
 
+-- ── Indexer State (cursor storage) ───────────────────────────────────────────
+-- Stores persistent key-value state for the indexer (e.g. SV Scan cursors)
+
+CREATE TABLE IF NOT EXISTS indexer_state (
+  key           TEXT        PRIMARY KEY,
+  value         TEXT        NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO schema_migrations (version)
+VALUES ('002_indexer_state')
+ON CONFLICT (version) DO NOTHING;
+
+-- ── Ledger Updates (SV Scan v2/updates stream) ────────────────────────────────
+-- Full ledger event stream from SV Scan API
+-- Only populated when SCAN_API_ENABLED=true and IP is whitelisted
+
+CREATE TABLE IF NOT EXISTS ledger_updates (
+  update_id       TEXT        NOT NULL,
+  network         TEXT        NOT NULL,
+  migration_id    INTEGER,
+  record_time     TIMESTAMPTZ,
+  effective_at    TIMESTAMPTZ,
+  event_count     INTEGER     NOT NULL DEFAULT 0,
+  template_ids    TEXT[]      NOT NULL DEFAULT '{}',
+  has_rewards     BOOLEAN     NOT NULL DEFAULT false,
+  has_transfers   BOOLEAN     NOT NULL DEFAULT false,
+  raw             JSONB       NOT NULL,
+  captured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (update_id, network)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_updates_network_time
+  ON ledger_updates (network, record_time DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_ledger_updates_migration
+  ON ledger_updates (network, migration_id DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_updates_has_rewards
+  ON ledger_updates (network, has_rewards) WHERE has_rewards = true;
+CREATE INDEX IF NOT EXISTS idx_ledger_updates_raw_gin
+  ON ledger_updates USING gin (raw);
+
+INSERT INTO schema_migrations (version)
+VALUES ('003_ledger_updates')
+ON CONFLICT (version) DO NOTHING;
+
+-- ── Scan Rewards (extracted from ledger_updates) ──────────────────────────────
+-- Reward events parsed from SV Scan updates stream
+-- More detailed than Lighthouse rewards — includes migration_id and template type
+
+CREATE TABLE IF NOT EXISTS scan_rewards (
+  update_id     TEXT        NOT NULL,
+  event_idx     INTEGER     NOT NULL,  -- position within update
+  network       TEXT        NOT NULL,
+  record_time   TIMESTAMPTZ,
+  migration_id  INTEGER,
+  party_id      TEXT        NOT NULL,
+  template      TEXT        NOT NULL,  -- short template name e.g. Splice.Amulet:ValidatorRewardCoupon
+  amount        NUMERIC(30, 10),
+  round         BIGINT,
+  captured_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (update_id, event_idx, network)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_rewards_party_network
+  ON scan_rewards (party_id, network, record_time DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_scan_rewards_network_round
+  ON scan_rewards (network, round DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_scan_rewards_template
+  ON scan_rewards (network, template);
+
+INSERT INTO schema_migrations (version)
+VALUES ('004_scan_rewards')
+ON CONFLICT (version) DO NOTHING;
+
+-- ── Scan Mining Rounds (from SV Scan open-and-issuing-mining-rounds) ──────────
+
+CREATE TABLE IF NOT EXISTS scan_mining_rounds (
+  contract_id   TEXT        NOT NULL,
+  network       TEXT        NOT NULL,
+  round_number  BIGINT,
+  round_type    TEXT        NOT NULL DEFAULT 'open',  -- open | issuing
+  amulet_price  NUMERIC(20, 8),
+  opens_at      TIMESTAMPTZ,
+  closes_at     TIMESTAMPTZ,
+  captured_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  raw           JSONB       NOT NULL,
+  PRIMARY KEY (contract_id, network)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_mining_rounds_network
+  ON scan_mining_rounds (network, round_number DESC NULLS LAST);
+
+INSERT INTO schema_migrations (version)
+VALUES ('005_scan_mining_rounds')
+ON CONFLICT (version) DO NOTHING;
+
 -- ── API Notes ─────────────────────────────────────────────────────────────────
 -- Verified against live Lighthouse API (testnet/mainnet, 2026-03-02):
 --   - /api/prices/latest → 404 (does not exist); price is in /api/stats as cc_price

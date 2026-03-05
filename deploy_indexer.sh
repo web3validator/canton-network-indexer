@@ -17,6 +17,13 @@ declare -A NET_LIGHTHOUSE=(
   [testnet]="https://lighthouse.testnet.cantonloop.com"
   [devnet]="https://lighthouse.devnet.cantonloop.com"
 )
+declare -A NET_SCAN_LIST=(
+  [mainnet]="https://scan.sv-1.global.canton.network.digitalasset.com https://scan.sv-2.global.canton.network.digitalasset.com https://scan.sv-1.global.canton.network.sync.global https://scan.sv-1.global.canton.network.cumberland.io https://scan.sv-1.global.canton.network.c7.digital https://scan.sv-1.global.canton.network.fivenorth.io"
+  [testnet]="https://scan.sv-1.test.global.canton.network.digitalasset.com https://scan.sv-2.test.global.canton.network.digitalasset.com https://scan.sv.test.global.canton.network.digitalasset.com https://scan.sv-1.test.global.canton.network.sync.global https://scan.sv-1.test.global.canton.network.cumberland.io"
+  [devnet]="https://scan.sv-1.dev.global.canton.network.digitalasset.com https://scan.sv-2.dev.global.canton.network.digitalasset.com https://scan.sv.dev.global.canton.network.digitalasset.com https://scan.sv-1.dev.global.canton.network.sync.global https://scan.sv-1.dev.global.canton.network.cumberland.io"
+)
+# Resolved at deploy time per network — populated by find_scan_url()
+declare -A NET_SCAN_RESOLVED=()
 declare -A NET_PORT=(
   [mainnet]="3010"
   [testnet]="3011"
@@ -198,6 +205,88 @@ fi
 IFS=',' read -ra DEPLOY_NETS <<< "$NETWORKS"
 info "Will deploy: ${DEPLOY_NETS[*]}"
 
+# ─── Data source mode ─────────────────────────────────────────────────────────
+header "Data Source"
+echo "Select data source:"
+echo "  1) Lighthouse only   — no whitelist needed, works everywhere (default)"
+echo "  2) SV Scan only      — requires IP whitelist from Canton Foundation"
+echo "  3) Both              — SV Scan primary, Lighthouse as fallback"
+echo ""
+echo -e "  ${YELLOW}⚠ SV Scan requires your server IP to be whitelisted.${NC}"
+echo "    Contact Pedro Neves <pedro@canton.foundation> to request access."
+echo ""
+read -rp "Choice [1]: " source_input
+source_input="${source_input:-1}"
+
+SCAN_API_ENABLED="false"
+SOURCE_MODE="lighthouse"
+
+case "$source_input" in
+  2|scan)
+    SCAN_API_ENABLED="true"
+    SOURCE_MODE="scan"
+    info "SV Scan mode — will probe available SVs per network"
+    ;;
+  3|both)
+    SCAN_API_ENABLED="true"
+    SOURCE_MODE="both"
+    info "Hybrid mode: SV Scan primary + Lighthouse fallback"
+    ;;
+  *)
+    info "Lighthouse only mode"
+    ;;
+esac
+
+# ─── SV Scan probe ────────────────────────────────────────────────────────────
+# For each network that needs SV Scan — find first reachable SV
+find_scan_url() {
+  local net="$1"
+  local candidates="${NET_SCAN_LIST[$net]:-}"
+  [[ -z "$candidates" ]] && return 1
+
+  info "Probing SV Scan nodes for $net..."
+  for url in $candidates; do
+    printf "  checking %-70s " "$url"
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url/api/scan/version" 2>/dev/null || echo "000")
+    if [[ "$status" == "200" ]]; then
+      echo -e "${GREEN}OK${NC}"
+      NET_SCAN_RESOLVED[$net]="$url"
+      return 0
+    else
+      echo -e "${RED}${status}${NC}"
+    fi
+  done
+  return 1
+}
+
+if [[ "$SCAN_API_ENABLED" == "true" ]]; then
+  header "Probing SV Scan Availability"
+  ALL_SCAN_OK=true
+  for net in "${DEPLOY_NETS[@]}"; do
+    net="${net// /}"
+    if find_scan_url "$net"; then
+      ok "$net → ${NET_SCAN_RESOLVED[$net]}"
+    else
+      warn "$net → no SV Scan node reachable (your IP may not be whitelisted)"
+      if [[ "$SOURCE_MODE" == "scan" ]]; then
+        warn "  Falling back to Lighthouse for $net"
+        warn "  To get whitelisted contact: pedro@canton.foundation"
+      else
+        warn "  Will use Lighthouse for $net"
+      fi
+      NET_SCAN_RESOLVED[$net]=""
+      ALL_SCAN_OK=false
+    fi
+  done
+
+  if [[ "$ALL_SCAN_OK" == "false" && "$SOURCE_MODE" == "scan" ]]; then
+    echo ""
+    warn "Some networks have no SV Scan access. Those will use Lighthouse instead."
+    echo -e "  ${YELLOW}To request IP whitelist: pedro@canton.foundation${NC}"
+    echo ""
+  fi
+fi
+
 # ─── Access mode ──────────────────────────────────────────────────────────────
 header "Access Configuration"
 echo "How will the API be accessed?"
@@ -241,13 +330,18 @@ fi
 # ─── Write config files ───────────────────────────────────────────────────────
 write_env() {
   local dir="$1" net="$2" lighthouse="$3" db_name="$4" db_pass="$5"
+  local scan_url="${NET_SCAN_RESOLVED[$net]:-}"
+  local scan_enabled="$SCAN_API_ENABLED"
+  # If scan was requested but no URL found — disable scan for this network
+  [[ -z "$scan_url" ]] && scan_enabled="false"
   printf 'CANTON_NETWORK=%s\nLIGHTHOUSE_URL=%s\nPORT=3000\nHOST=0.0.0.0\nLOG_LEVEL=info\n' \
     "$net" "$lighthouse" > "$dir/.env"
   printf 'DB_NAME=%s\nDB_USER=canton\nDB_PASSWORD=%s\nDATABASE_URL=postgres://canton:%s@postgres:5432/%s\n' \
     "$db_name" "$db_pass" "$db_pass" "$db_name" >> "$dir/.env"
   printf 'POLL_STATS_SEC=60\nPOLL_VALIDATORS_SEC=300\nPOLL_REWARDS_SEC=900\n' >> "$dir/.env"
   printf 'POLL_GOVERNANCE_SEC=1800\nPOLL_SNAPSHOT_SEC=3600\n' >> "$dir/.env"
-  printf 'VALIDATOR_API_ENABLED=false\nSCAN_API_ENABLED=false\n' >> "$dir/.env"
+  printf 'VALIDATOR_API_ENABLED=false\nSCAN_API_ENABLED=%s\nSCAN_API_URL=%s\n' \
+    "$scan_enabled" "$scan_url" >> "$dir/.env"
 }
 
 write_compose() {
@@ -440,17 +534,16 @@ if [[ "$NGINX_MODE" == "domain" ]]; then
       warn "nginx config test failed — check $NGINX_CONF"
     fi
 
-    # SSL via certbot
+    # SSL via certbot — auto-install if missing
+    if ! command -v certbot &>/dev/null; then
+      info "certbot not found — installing..."
+      sudo apt-get install -y certbot python3-certbot-nginx -qq && ok "certbot installed" || \
+        warn "certbot install failed — SSL skipped"
+    fi
     if command -v certbot &>/dev/null; then
-      read -rp "$(echo -e "${BOLD}Run certbot for SSL? [y/N]:${NC} ")" ssl_input
-      if [[ "${ssl_input,,}" == "y" ]]; then
-        sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email || \
-          warn "certbot failed — run manually: sudo certbot --nginx -d $DOMAIN"
-      fi
-    else
-      warn "certbot not installed — to enable SSL:"
-      echo "  sudo apt install certbot python3-certbot-nginx -y"
-      echo "  sudo certbot --nginx -d $DOMAIN"
+      sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email \
+        && ok "SSL certificate obtained for $DOMAIN" \
+        || warn "certbot failed — run manually: sudo certbot --nginx -d $DOMAIN"
     fi
   else
     warn "nginx not installed — config saved to /tmp/canton-nginx.conf"

@@ -1,7 +1,14 @@
 import cron from "node-cron";
 import { config } from "./config.js";
 import { lighthouse } from "./collectors/lighthouse.js";
-import { query } from "./storage/db.js";
+import {
+  scan,
+  matchesTemplate,
+  REWARD_TEMPLATES,
+  TRANSFER_TEMPLATES,
+  MiningRound,
+} from "./collectors/scan.js";
+import { query, queryOne } from "./storage/db.js";
 
 function secToCron(seconds: number): string {
   if (seconds < 60) return `*/${seconds} * * * * *`;
@@ -274,6 +281,195 @@ async function pollFullSnapshot(): Promise<void> {
   console.log("[scheduler] full snapshot done");
 }
 
+// ── SV Scan cursor helpers ────────────────────────────────────────────────────
+
+const CURSOR_KEY = `scan_cursor_${network}`;
+
+async function loadCursor(): Promise<{
+  after_migration_id: number;
+  after_record_time: string;
+} | null> {
+  try {
+    const row = await queryOne<{ value: string }>(
+      `SELECT value FROM indexer_state WHERE key = $1`,
+      [CURSOR_KEY],
+    );
+    if (!row) return null;
+    return JSON.parse(row.value) as { after_migration_id: number; after_record_time: string };
+  } catch {
+    return null;
+  }
+}
+
+async function saveCursor(cursor: {
+  after_migration_id: number;
+  after_record_time: string;
+}): Promise<void> {
+  await query(
+    `INSERT INTO indexer_state (key, value, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+    [CURSOR_KEY, JSON.stringify(cursor)],
+  );
+}
+
+// ── SV Scan pollers ───────────────────────────────────────────────────────────
+
+async function pollScanUpdates(): Promise<void> {
+  if (!scan.enabled) return;
+
+  const cursor = await loadCursor();
+  console.log(
+    `[scheduler] scan updates polling, cursor=${cursor ? JSON.stringify(cursor) : "none"}`,
+  );
+  // If no cursor — start from latest (newest first), then catch up forward
+  const res = cursor ? await scan.getUpdates(100, cursor) : await scan.getLatestUpdates(100);
+
+  if (!res.ok) {
+    console.warn(`[scheduler] scan updates failed: status=${res.status} error=${res.error}`);
+    return;
+  }
+
+  const updates = res.data.transactions ?? [];
+  console.log(`[scheduler] scan updates response: ${updates.length} transactions`);
+  if (updates.length === 0) return;
+
+  let inserted = 0;
+  let rewardRows = 0;
+
+  for (const update of updates) {
+    const events = Object.values(update.events_by_id);
+    const templateIds = [...new Set(events.map((e) => e.template_id))];
+    const hasRewards = events.some(
+      (e) => e.event_type === "created_event" && matchesTemplate(e.template_id, REWARD_TEMPLATES),
+    );
+    const hasTransfers = events.some(
+      (e) =>
+        e.event_type === "exercised_event" && matchesTemplate(e.template_id, TRANSFER_TEMPLATES),
+    );
+
+    const result = await query(
+      `INSERT INTO ledger_updates
+         (update_id, network, migration_id, record_time, effective_at, event_count, template_ids, has_rewards, has_transfers, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (update_id, network) DO NOTHING`,
+      [
+        update.update_id,
+        network,
+        update.migration_id ?? null,
+        update.record_time ?? null,
+        update.effective_at ?? null,
+        events.length,
+        templateIds,
+        hasRewards,
+        hasTransfers,
+        JSON.stringify(update),
+      ],
+    );
+    inserted += result.rowCount ?? 0;
+
+    // Extract and persist reward events
+    if (hasRewards && (result.rowCount ?? 0) > 0) {
+      const rewardEvents = scan.extractRewardEvents([update]);
+      for (let i = 0; i < rewardEvents.length; i++) {
+        const r = rewardEvents[i];
+        await query(
+          `INSERT INTO scan_rewards
+             (update_id, event_idx, network, record_time, migration_id, party_id, template, amount, round)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (update_id, event_idx, network) DO NOTHING`,
+          [
+            r.update_id,
+            i,
+            network,
+            r.record_time ?? null,
+            r.migration_id ?? null,
+            r.party_id,
+            r.template,
+            r.amount !== null ? parseFloat(r.amount) : null,
+            r.round !== null ? parseInt(r.round, 10) : null,
+          ],
+        );
+        rewardRows++;
+      }
+    }
+  }
+
+  // Save cursor from last update for next poll
+  const last = updates[updates.length - 1];
+  if (last && last.migration_id !== undefined && last.record_time) {
+    await saveCursor({
+      after_migration_id: last.migration_id,
+      after_record_time: last.record_time,
+    });
+  }
+
+  if (inserted > 0) {
+    console.log(
+      `[scheduler] scan updates: ${updates.length} fetched, ${inserted} new, ${rewardRows} reward events`,
+    );
+  }
+}
+
+async function pollScanMiningRounds(): Promise<void> {
+  if (!scan.enabled) return;
+
+  const res = await scan.getOpenAndIssuingMiningRounds();
+  if (!res.ok) {
+    console.warn(`[scheduler] scan mining rounds failed: ${res.error}`);
+    return;
+  }
+
+  // Guard against unexpected response structure
+  const data = res.data as unknown as Record<string, unknown>;
+  const openRounds = Array.isArray(data["open_mining_rounds"])
+    ? (data["open_mining_rounds"] as MiningRound[])
+    : [];
+  const issuingRounds = Array.isArray(data["issuing_mining_rounds"])
+    ? (data["issuing_mining_rounds"] as MiningRound[])
+    : [];
+
+  const allRounds = [
+    ...openRounds.map((r) => ({ ...r, type: "open" })),
+    ...issuingRounds.map((r) => ({ ...r, type: "issuing" })),
+  ];
+
+  for (const r of allRounds) {
+    const contractId = r.contract_id;
+    if (!contractId) continue;
+    const roundNum = r.round?.number ? parseInt(r.round.number, 10) : null;
+    const amuletPrice = r.amulet_price ? parseFloat(r.amulet_price) : null;
+
+    await query(
+      `INSERT INTO scan_mining_rounds
+         (contract_id, network, round_number, round_type, amulet_price, opens_at, closes_at, raw)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (contract_id, network) DO UPDATE SET
+         round_type   = EXCLUDED.round_type,
+         amulet_price = EXCLUDED.amulet_price,
+         closes_at    = EXCLUDED.closes_at,
+         captured_at  = NOW(),
+         raw          = EXCLUDED.raw`,
+      [
+        contractId,
+        network,
+        roundNum,
+        r.type,
+        amuletPrice,
+        r.opens_at ?? null,
+        r.target_closes_at ?? null,
+        JSON.stringify(r),
+      ],
+    );
+  }
+
+  if (allRounds.length > 0) {
+    console.log(
+      `[scheduler] scan mining rounds: ${allRounds.length} (${res.data.open_mining_rounds.length} open, ${res.data.issuing_mining_rounds.length} issuing)`,
+    );
+  }
+}
+
 // ── Scheduler ────────────────────────────────────────────────────────────────
 
 let started = false;
@@ -307,8 +503,28 @@ export function startScheduler(): void {
     await pollFullSnapshot();
   });
 
+  // SV Scan polling — only if SCAN_API_ENABLED=true
+  if (scan.enabled) {
+    console.log(`[scheduler] SV Scan enabled — polling ${config.scanApi.baseUrl}`);
+
+    // Poll updates every 30s
+    cron.schedule("*/30 * * * * *", async () => {
+      await pollScanUpdates();
+    });
+
+    // Poll mining rounds every 60s
+    cron.schedule("*/60 * * * * *", async () => {
+      await pollScanMiningRounds();
+    });
+
+    // Initial run
+    void pollScanUpdates();
+    void pollScanMiningRounds();
+  }
+
   console.log("[scheduler] started", {
     network,
+    scan: scan.enabled ? config.scanApi.baseUrl : "disabled (set SCAN_API_ENABLED=true)",
     statsAndPrices: `${p.statsAndPrices}s`,
     validatorsAndRounds: `${p.validatorsAndRounds}s`,
     rewardsAndTransactions: `${p.rewardsAndTransactions}s`,

@@ -5,6 +5,7 @@ import swaggerUi from "@fastify/swagger-ui";
 import { config } from "../config.js";
 import { checkConnection, migrate } from "../storage/db.js";
 import { lighthouse } from "../collectors/lighthouse.js";
+import { scan } from "../collectors/scan.js";
 import { registerStatsRoutes } from "./routes/stats.js";
 import { registerValidatorRoutes } from "./routes/validators.js";
 import { registerTransactionRoutes } from "./routes/transactions.js";
@@ -121,6 +122,8 @@ export async function buildServer(): Promise<FastifyInstance> {
               uptime: { type: "number" },
               lighthouse: { type: "boolean" },
               lighthouse_last_ok: { type: "string", nullable: true },
+              scan: { type: "boolean", nullable: true },
+              scan_last_ok: { type: "string", nullable: true },
             },
           },
         },
@@ -130,6 +133,9 @@ export async function buildServer(): Promise<FastifyInstance> {
       const db = await checkConnection();
       const lhReachable = lighthouse.lastReachable;
       const lhLastOk = lighthouse.lastReachableAt?.toISOString() ?? null;
+      const scanEnabled = config.scanApi.enabled;
+      const scanReachable = scanEnabled ? scan.lastReachable : null;
+      const scanLastOk = scanEnabled ? (scan.lastReachableAt?.toISOString() ?? null) : null;
       const status = db && lhReachable ? "ok" : "degraded";
       return reply.send({
         status,
@@ -137,6 +143,7 @@ export async function buildServer(): Promise<FastifyInstance> {
         db,
         lighthouse: lhReachable,
         lighthouse_last_ok: lhLastOk,
+        ...(scanEnabled && { scan: scanReachable, scan_last_ok: scanLastOk }),
         uptime: process.uptime(),
       });
     },
@@ -156,8 +163,6 @@ export async function buildServer(): Promise<FastifyInstance> {
 
 export async function startServer(): Promise<void> {
   const server = await buildServer();
-
-  await migrate();
 
   try {
     await server.listen({ host: config.server.host, port: config.server.port });

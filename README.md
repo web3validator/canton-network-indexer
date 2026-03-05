@@ -1,6 +1,6 @@
 # Canton Network Indexer
 
-Unified REST API for Canton Network — aggregates Lighthouse Explorer, SV Scan, and Validator APIs into a single queryable layer with historical persistence for rewards, prices, and uptime.
+Unified REST API for Canton Network — aggregates Lighthouse Explorer and Validator APIs into a single queryable layer with historical persistence for rewards, prices, and uptime.
 
 ## Why
 
@@ -39,17 +39,20 @@ Use the included `deploy_indexer.sh` to deploy one or more networks on a remote 
 | devnet  | 3012 | 5442 |
 
 ```bash
-# Interactive
+# Interactive local deploy
 bash deploy_indexer.sh
 
-# Deploy all three networks
-bash deploy_indexer.sh -h 1.2.3.4 -u ubuntu -n mainnet,testnet,devnet
+# Deploy all three networks locally
+bash deploy_indexer.sh -n mainnet,testnet,devnet
+
+# Deploy on a remote server
+bash deploy_indexer.sh --remote 1.2.3.4 --user ubuntu -n mainnet,testnet,devnet
 
 # Check status
-bash deploy_indexer.sh -h 1.2.3.4 -u ubuntu --status
+bash deploy_indexer.sh --status
 
 # Stop a network
-bash deploy_indexer.sh -h 1.2.3.4 -u ubuntu --stop devnet
+bash deploy_indexer.sh --stop devnet
 ```
 
 After deploy, configure nginx to expose the APIs publicly — see `nginx-indexer.conf` for a ready-to-use config with mainnet at `/` and `/testnet/`, `/devnet/` paths.
@@ -58,7 +61,7 @@ After deploy, configure nginx to expose the APIs publicly — see `nginx-indexer
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /health` | Health check + DB status |
+| `GET /health` | Health check — DB status + Lighthouse reachability |
 | `GET /api/stats` | Latest network stats |
 | `GET /api/stats/history` | Historical stats snapshots |
 | `GET /api/validators` | All validators |
@@ -106,7 +109,7 @@ VALIDATOR_API_ENABLED=false   # enable for balance/party queries
 SCAN_API_ENABLED=false        # enable if IP is whitelisted by Canton Foundation
 ```
 
-**SV Scan API:** Contact Canton Foundation to get your server IP whitelisted. Once whitelisted, set `SCAN_API_ENABLED=true` and `SCAN_API_URL=https://scan.sv-1.global.canton.network.digitalasset.com` for access to full ledger data.
+**SV Scan API:** The SV Scan API requires IP whitelisting by Canton Foundation. Contact them to get your server IP approved. Once whitelisted, set `SCAN_API_ENABLED=true` and `SCAN_API_URL` to your assigned SV endpoint for access to full ledger data. Without whitelist, all SV Scan requests return 403.
 
 ## Networks
 

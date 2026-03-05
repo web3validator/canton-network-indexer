@@ -1,10 +1,10 @@
-import { startServer } from './api/server.js';
-import { startScheduler } from './scheduler.js';
-import { checkConnection } from './storage/db.js';
+import { startServer } from "./api/server.js";
+import { startScheduler } from "./scheduler.js";
+import { checkConnection, migrate } from "./storage/db.js";
 
 async function main(): Promise<void> {
-  console.log('[main] Canton Network Indexer starting...');
-  console.log(`[main] network: ${process.env['CANTON_NETWORK'] ?? 'mainnet'}`);
+  console.log("[main] Canton Network Indexer starting...");
+  console.log(`[main] network: ${process.env["CANTON_NETWORK"] ?? "mainnet"}`);
 
   // Wait for DB to be ready (retry up to 30s)
   let dbReady = false;
@@ -16,17 +16,19 @@ async function main(): Promise<void> {
   }
 
   if (!dbReady) {
-    console.error('[main] database not reachable after 30s — exiting');
+    console.error("[main] database not reachable after 30s — exiting");
     process.exit(1);
   }
 
-  console.log('[main] database connected');
+  console.log("[main] database connected");
+
+  await migrate();
 
   startScheduler();
   await startServer();
 }
 
 main().catch((err) => {
-  console.error('[main] fatal error', err);
+  console.error("[main] fatal error", err);
   process.exit(1);
 });
