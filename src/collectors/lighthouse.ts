@@ -32,7 +32,7 @@ export interface LighthouseValidator {
   [key: string]: unknown;
 }
 
-const VALIDATOR_ACTIVE_THRESHOLD_MS = 10 * 60 * 1000;
+const VALIDATOR_ACTIVE_THRESHOLD_MS = 40 * 60 * 1000;
 
 export function normalizeValidator(v: LighthouseValidator): LighthouseValidator {
   if (typeof v.is_active === "boolean") return v;
