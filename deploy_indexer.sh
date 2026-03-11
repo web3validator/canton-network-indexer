@@ -205,6 +205,24 @@ fi
 IFS=',' read -ra DEPLOY_NETS <<< "$NETWORKS"
 info "Will deploy: ${DEPLOY_NETS[*]}"
 
+# ─── Validator node monitoring ────────────────────────────────────────────────
+header "Validator Node Monitoring (optional)"
+echo "If this server runs a splice-validator node, the indexer can monitor"
+echo "ledger ingestion lag via its local postgres database."
+echo ""
+echo "To enable, provide the validator postgres connection string."
+echo "Example: postgres://cnadmin:password@splice-validator-postgres-splice-1:5432/validator"
+echo ""
+read -rp "VALIDATOR_DB_URL (leave empty to skip): " VALIDATOR_DB_URL
+VALIDATOR_NETWORK_NAME=""
+if [[ -n "$VALIDATOR_DB_URL" ]]; then
+  read -rp "Docker network name of the validator (default: splice-validator_splice_validator): " VALIDATOR_NETWORK_NAME
+  VALIDATOR_NETWORK_NAME="${VALIDATOR_NETWORK_NAME:-splice-validator_splice_validator}"
+  ok "Node monitoring enabled — will connect to network: $VALIDATOR_NETWORK_NAME"
+else
+  info "Node monitoring skipped"
+fi
+
 # ─── Data source mode ─────────────────────────────────────────────────────────
 header "Data Source"
 echo "Select data source:"
@@ -332,7 +350,6 @@ write_env() {
   local dir="$1" net="$2" lighthouse="$3" db_name="$4" db_pass="$5"
   local scan_url="${NET_SCAN_RESOLVED[$net]:-}"
   local scan_enabled="$SCAN_API_ENABLED"
-  # If scan was requested but no URL found — disable scan for this network
   [[ -z "$scan_url" ]] && scan_enabled="false"
   printf 'CANTON_NETWORK=%s\nLIGHTHOUSE_URL=%s\nPORT=3000\nHOST=0.0.0.0\nLOG_LEVEL=info\n' \
     "$net" "$lighthouse" > "$dir/.env"
@@ -342,53 +359,75 @@ write_env() {
   printf 'POLL_GOVERNANCE_SEC=1800\nPOLL_SNAPSHOT_SEC=3600\n' >> "$dir/.env"
   printf 'VALIDATOR_API_ENABLED=false\nSCAN_API_ENABLED=%s\nSCAN_API_URL=%s\n' \
     "$scan_enabled" "$scan_url" >> "$dir/.env"
+  if [[ -n "${VALIDATOR_DB_URL:-}" ]]; then
+    printf 'VALIDATOR_DB_URL=%s\n' "$VALIDATOR_DB_URL" >> "$dir/.env"
+  fi
 }
 
 write_compose() {
   local dir="$1" net="$2" port="$3" db_port="$4" db_name="$5" db_pass="$6"
-  printf '%s\n' \
-    "version: '3.9'" \
-    "services:" \
-    "  postgres:" \
-    "    image: postgres:16-alpine" \
-    "    container_name: canton-${net}-postgres" \
-    "    restart: unless-stopped" \
-    "    environment:" \
-    "      POSTGRES_DB: ${db_name}" \
-    "      POSTGRES_USER: canton" \
-    "      POSTGRES_PASSWORD: ${db_pass}" \
-    "    volumes:" \
-    "      - postgres_data:/var/lib/postgresql/data" \
-    "    ports:" \
-    "      - \"127.0.0.1:${db_port}:5432\"" \
-    "    healthcheck:" \
-    "      test: [\"CMD-SHELL\", \"pg_isready -U canton -d ${db_name}\"]" \
-    "      interval: 5s" \
-    "      timeout: 5s" \
-    "      retries: 10" \
-    "  indexer:" \
-    "    build:" \
-    "      context: ." \
-    "      dockerfile: Dockerfile" \
-    "    container_name: canton-${net}-indexer" \
-    "    restart: unless-stopped" \
-    "    depends_on:" \
-    "      postgres:" \
-    "        condition: service_healthy" \
-    "    env_file: .env" \
-    "    environment:" \
-    "      DATABASE_URL: postgres://canton:${db_pass}@postgres:5432/${db_name}" \
-    "    ports:" \
-    "      - \"127.0.0.1:${port}:3000\"" \
-    "    healthcheck:" \
-    "      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:3000/health || exit 1\"]" \
-    "      interval: 15s" \
-    "      timeout: 5s" \
-    "      retries: 5" \
-    "      start_period: 60s" \
-    "volumes:" \
-    "  postgres_data:" \
-    > "$dir/docker-compose.yml"
+  {
+    printf '%s\n' \
+      "version: '3.9'" \
+      "services:" \
+      "  postgres:" \
+      "    image: postgres:16-alpine" \
+      "    container_name: canton-${net}-postgres" \
+      "    restart: unless-stopped" \
+      "    environment:" \
+      "      POSTGRES_DB: ${db_name}" \
+      "      POSTGRES_USER: canton" \
+      "      POSTGRES_PASSWORD: ${db_pass}" \
+      "    volumes:" \
+      "      - postgres_data:/var/lib/postgresql/data" \
+      "    ports:" \
+      "      - \"127.0.0.1:${db_port}:5432\"" \
+      "    healthcheck:" \
+      "      test: [\"CMD-SHELL\", \"pg_isready -U canton -d ${db_name}\"]" \
+      "      interval: 5s" \
+      "      timeout: 5s" \
+      "      retries: 10" \
+      "  indexer:" \
+      "    build:" \
+      "      context: ." \
+      "      dockerfile: Dockerfile" \
+      "    container_name: canton-${net}-indexer" \
+      "    restart: unless-stopped" \
+      "    depends_on:" \
+      "      postgres:" \
+      "        condition: service_healthy" \
+      "    env_file: .env" \
+      "    environment:" \
+      "      DATABASE_URL: postgres://canton:${db_pass}@postgres:5432/${db_name}"
+    if [[ -n "${VALIDATOR_DB_URL:-}" ]]; then
+      printf '      VALIDATOR_DB_URL: %s\n' "$VALIDATOR_DB_URL"
+    fi
+    printf '%s\n' \
+      "    ports:" \
+      "      - \"127.0.0.1:${port}:3000\""
+    if [[ -n "${VALIDATOR_NETWORK_NAME:-}" ]]; then
+      printf '%s\n' \
+        "    networks:" \
+        "      - default" \
+        "      - splice_validator"
+    fi
+    printf '%s\n' \
+      "    healthcheck:" \
+      "      test: [\"CMD-SHELL\", \"wget -qO- http://127.0.0.1:3000/health || exit 1\"]" \
+      "      interval: 15s" \
+      "      timeout: 5s" \
+      "      retries: 5" \
+      "      start_period: 60s" \
+      "volumes:" \
+      "  postgres_data:"
+    if [[ -n "${VALIDATOR_NETWORK_NAME:-}" ]]; then
+      printf '%s\n' \
+        "networks:" \
+        "  splice_validator:" \
+        "    external: true" \
+        "    name: ${VALIDATOR_NETWORK_NAME}"
+    fi
+  } > "$dir/docker-compose.yml"
 }
 
 # ─── Deploy each network ──────────────────────────────────────────────────────
@@ -441,6 +480,17 @@ for net in "${DEPLOY_NETS[@]}"; do
 
   info "Building and starting $net..."
   run_cmd "cd $deploy_dir && docker compose up -d --build 2>&1" | tail -15
+
+  if [[ -n "${VALIDATOR_NETWORK_NAME:-}" ]]; then
+    info "Connecting canton-${net}-indexer to validator network: $VALIDATOR_NETWORK_NAME"
+    if $REMOTE_MODE; then
+      ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" \
+        "docker network connect $VALIDATOR_NETWORK_NAME canton-${net}-indexer 2>/dev/null && echo connected || echo already connected" || true
+    else
+      docker network connect "$VALIDATOR_NETWORK_NAME" "canton-${net}-indexer" 2>/dev/null && \
+        ok "Connected to $VALIDATOR_NETWORK_NAME" || info "Already connected to $VALIDATOR_NETWORK_NAME"
+    fi
+  fi
 
   info "Waiting for $net to become healthy (up to 120s)..."
   health=""
