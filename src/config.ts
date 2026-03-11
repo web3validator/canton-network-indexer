@@ -93,8 +93,11 @@ export const config = {
     user: optional("DB_USER", "canton"),
     password: optional("DB_PASSWORD", "canton"),
     poolMax: optionalInt("DB_POOL_MAX", 10),
-    // Full connection string takes priority if provided
     connectionString: optional("DATABASE_URL", ""),
+  },
+
+  validatorDb: {
+    connectionString: optional("VALIDATOR_DB_URL", ""),
   },
 
   polling: {

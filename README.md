@@ -203,6 +203,10 @@ POLL_SNAPSHOT_SEC=3600
 # SV Scan (requires IP whitelist from Canton Foundation)
 SCAN_API_ENABLED=false
 SCAN_API_URL=
+
+# Validator node lag monitoring (optional)
+# Connect to the local splice-validator postgres to track ledger ingestion lag
+VALIDATOR_DB_URL=postgres://cnadmin:password@splice-validator-postgres-splice-1:5432/validator
 ```
 
 ## Database Schema
@@ -240,6 +244,67 @@ npm run dev        # hot reload via tsx
 npm run build      # compile TypeScript to dist/
 npm start          # run compiled
 ```
+
+## Validator Node Monitoring
+
+The indexer can monitor how far behind the local validator node is in processing the ledger. This powers the node lag alerts in the alert bot.
+
+### Setup
+
+1. Set `VALIDATOR_DB_URL` in `.env` pointing to the splice-validator postgres:
+
+```env
+VALIDATOR_DB_URL=postgres://cnadmin:password@splice-validator-postgres-splice-1:5432/validator
+```
+
+2. Connect the indexer container to the validator's Docker network:
+
+```bash
+docker network connect splice-validator_splice_validator <indexer-container-name>
+```
+
+Or declare it in `docker-compose.yml`:
+
+```yaml
+services:
+  indexer:
+    networks:
+      - default
+      - splice_validator
+
+networks:
+  splice_validator:
+    external: true
+    name: splice-validator_splice_validator
+```
+
+### Endpoint
+
+```
+GET /api/validator/node-status
+```
+
+Response:
+
+```json
+{
+  "enabled": true,
+  "lag_seconds": 45,
+  "last_ingested_at": "2026-03-11T03:38:00.625Z",
+  "is_healthy": true,
+  "validator_name": "web34ever",
+  "validator_party": "web34ever::1220256be83146060986872d129d6dc37ab66e9706903438b5c3a590f976c53b3802"
+}
+```
+
+- `enabled: false` — `VALIDATOR_DB_URL` not set, feature disabled
+- `lag_seconds` — seconds since last ledger transaction ingested
+- `is_healthy` — `true` if lag < 1200s (20 min)
+
+The alert bot polls this endpoint every 60 seconds and sends alerts when:
+- lag ≥ 600s (10 min) → ⚠️ node slow
+- lag ≥ 1200s (20 min) → 🔴 node offline
+- lag recovers below 600s → 🟢 node recovered
 
 ## Live Instances
 

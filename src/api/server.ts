@@ -14,6 +14,7 @@ import { registerGovernanceRoutes } from "./routes/governance.js";
 import { registerPartyRoutes } from "./routes/parties.js";
 import { registerRoundRoutes } from "./routes/rounds.js";
 import { registerMiscRoutes } from "./routes/misc.js";
+import { registerValidatorNodeRoutes } from "./routes/validator-node.js";
 
 export async function buildServer(): Promise<FastifyInstance> {
   const server = Fastify({
@@ -157,6 +158,7 @@ export async function buildServer(): Promise<FastifyInstance> {
   await server.register(registerRoundRoutes, { prefix: "/api" });
   await server.register(registerGovernanceRoutes, { prefix: "/api" });
   await server.register(registerMiscRoutes, { prefix: "/api" });
+  await server.register(registerValidatorNodeRoutes, { prefix: "/api" });
 
   return server;
 }

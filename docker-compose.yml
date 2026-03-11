@@ -46,6 +46,10 @@ services:
       VALIDATOR_JWT_TOKEN: ${VALIDATOR_JWT_TOKEN:-}
       SCAN_API_ENABLED: ${SCAN_API_ENABLED:-false}
       SCAN_API_URL: ${SCAN_API_URL:-}
+      VALIDATOR_DB_URL: ${VALIDATOR_DB_URL:-}
+    networks:
+      - default
+      - validator_node
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
     healthcheck:
@@ -57,3 +61,9 @@ services:
 
 volumes:
   postgres_data:
+
+networks:
+  default: {}
+  validator_node:
+    external: true
+    name: ${VALIDATOR_NETWORK:-splice-validator_splice_validator}
